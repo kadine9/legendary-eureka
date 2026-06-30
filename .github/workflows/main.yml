@@ -1,0 +1,65 @@
+name: Extract ZIP to Main Directory
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          # Required to allow pushing code back to the repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract and Flatten ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE=$(find . -maxdepth 1 -name '*.zip' -print -quit)
+          [ -n "$ZIP_FILE" ] || { echo "Error: No ZIP file found"; exit 1; }
+
+          rm -rf extract_tmp target_dir
+          mkdir extract_tmp target_dir
+          
+          unzip -q "$ZIP_FILE" -d extract_tmp
+          rm -f "$ZIP_FILE"
+
+          find extract_tmp -name "__MACOSX" -exec rm -rf {} + 2>/dev/null || true
+          find extract_tmp -name ".DS_Store" -exec rm -f {} + 2>/dev/null || true
+
+          shopt -s dotglob nullglob
+          items=(extract_tmp/*)
+          shopt -u dotglob nullglob
+
+          if [ ${#items[@]} -eq 1 ] && [ -d "${items}" ]; then
+            SRC="${items}"
+          else
+            SRC="extract_tmp"
+          fi
+
+          find "$SRC" -mindepth 1 -maxdepth 1 -exec mv -t target_dir/ {} +
+          rm -rf extract_tmp
+          
+          find target_dir -mindepth 1 -maxdepth 1 -exec cp -rp -t ./ {} +
+          rm -rf target_dir
+
+      # NEW STEP: Commit the unzipped files back into your main branch
+      - name: Save Files to Repository
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@://github.com"
+          
+          git add .
+          
+          # Only commit if there are actually changes to prevent workflow crashes
+          if git diff --staged --quiet; then
+            echo "No new files to save."
+          else
+            git commit -m "Unzipped project files to main directory"
+            git push origin main
+          fi
