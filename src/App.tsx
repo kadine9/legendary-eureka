@@ -13,12 +13,42 @@ function isValidHttpLink(v: string) {
   const s = (v || "").trim();
   return /^https?:\/\/[^\s]+$/i.test(s);
 }
+// Derives a clean, human-readable title from a URL's last path segment
+// (decodes %xx escapes, strips common file extensions, turns -._+ into
+// spaces, and title-cases the result) instead of just gluing the hostname
+// and raw path together.
 function parseHttpLinkTitle(url: string) {
   if (!url) return "";
   try {
     const u = new URL(url.trim());
-    const path = u.pathname && u.pathname !== "/" ? u.pathname.replace(/\/+$/, "") : "";
-    return path ? `${u.hostname}${path}` : u.hostname;
+    const GENERIC = new Set(["watch", "view", "video", "videos", "stream", "streaming", "play", "embed", "link", "links", "media", "content", "item", "post", "article"]);
+    const segments = u.pathname.split("/").filter(Boolean);
+    if (!segments.length) return u.hostname.replace(/^www\./i, "");
+
+    // Use the last couple of path segments so a "show-slug/episode-12" style
+    // URL keeps the show name alongside the episode info — needed for
+    // grouping/sorting by show — instead of just the final slug. Drop purely
+    // navigational segments like "watch"/"stream" so they don't clutter it.
+    let win = segments.length > 2 ? segments.slice(-2) : segments;
+    if (win.length > 1) win = win.filter((s) => !GENERIC.has(s.toLowerCase()));
+    if (!win.length) win = [segments[segments.length - 1]];
+
+    const decoded = win.map((seg, i) => {
+      let s = i === win.length - 1 ? seg.replace(/\.(html?|php|aspx?|jsp|m3u8|mp4|mkv|webm|json|xml)$/i, "") : seg;
+      try { s = decodeURIComponent(s); } catch { /* leave as-is if malformed escape */ }
+      return s;
+    });
+
+    let title = decoded.join(" ").replace(/[-_+.]+/g, " ").replace(/\s+/g, " ").trim();
+    if (!title) return u.hostname.replace(/^www\./i, "");
+
+    title = title
+      .split(" ")
+      .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : w))
+      .join(" ");
+    // Normalize season/episode casing, e.g. "S01e02" -> "S01E02"
+    title = title.replace(/\bs(\d{1,4})e(\d{1,4})\b/i, (_m, s, e) => `S${s}E${e}`);
+    return title;
   } catch {
     return "";
   }
@@ -33,20 +63,25 @@ function extractHttpLinks(text: string): string[] {
     .map((s) => s.trim().replace(/[\s,;]+$/, ""))
     .filter((s) => /^https?:\/\//i.test(s));
 }
-function parseSeasonEpisode(title: string) {
+function parseSeasonEpisode(title: string): { season: number | null; episode: number | null } | null {
   if (!title) return null;
   let m = title.match(/s(\d{1,4})[\s._-]*e(\d{1,4})/i);
   if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10) };
   m = title.match(/\b(\d{1,2})x(\d{1,3})\b/i);
   if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10) };
+  // Episode-only formats with no season marker, e.g. "Episode 12", "Ep.12", "Ep 12"
+  m = title.match(/\bepisode[\s._-]*(\d{1,4})\b/i);
+  if (m) return { season: null, episode: parseInt(m[1], 10) };
+  m = title.match(/\bep[\s._-]*(\d{1,4})\b/i);
+  if (m) return { season: null, episode: parseInt(m[1], 10) };
   m = title.match(/\b(?:s|season)[\s._-]*(\d{1,4})(?!\d)/i);
-  if (m) return { season: parseInt(m[1], 10), episode: null as number | null };
+  if (m) return { season: parseInt(m[1], 10), episode: null };
   return null;
 }
 function stripShowName(title: string) {
   if (!title) return "";
   let name = title.replace(/[._]+/g, " ");
-  const seMatch = name.match(/\b(s\d{1,4}[\s._-]*e\d{1,4}|\d{1,2}x\d{1,4}|(?:s|season)[\s._-]*\d{1,4})(?!\d)/i);
+  const seMatch = name.match(/\b(s\d{1,4}[\s._-]*e\d{1,4}|\d{1,2}x\d{1,4}|episode[\s._-]*\d{1,4}|ep[\s._-]*\d{1,4}|(?:s|season)[\s._-]*\d{1,4})(?!\d)/i);
   if (seMatch && seMatch.index !== undefined) name = name.slice(0, seMatch.index);
   return name.replace(/\s+/g, " ").trim().toLowerCase();
 }
@@ -54,8 +89,9 @@ function episodeKey(title: string) {
   const show = stripShowName(title);
   const se = parseSeasonEpisode(title);
   if (se) {
+    const seasonStr = se.season !== null ? `s${String(se.season).padStart(2, "0")}` : "";
     const epStr = se.episode !== null ? `e${String(se.episode).padStart(2, "0")}` : "";
-    return `${show}|s${String(se.season).padStart(2, "0")}${epStr}`;
+    return `${show}|${seasonStr}${epStr}`;
   }
   return show || title.toLowerCase().trim();
 }
@@ -191,7 +227,7 @@ function HttpLinkRow({ l, selected, onToggle, onCopy, onDelete }: HttpLinkRowPro
         <div className="link-meta">
           <div className="link-title-wrap">
             <span className="link-title">{l.title || "(untitled)"}</span>
-            {se && <span className="ep-badge">S{String(se.season).padStart(2, "0")}{se.episode !== null ? "E" + String(se.episode).padStart(2, "0") : ""}</span>}
+            {se && <span className="ep-badge">{se.season !== null ? "S" + String(se.season).padStart(2, "0") : ""}{se.episode !== null ? "E" + String(se.episode).padStart(2, "0") : ""}</span>}
           </div>
           <p className="link-magnet">{l.url}</p>
           <p className="link-date">{date}</p>
@@ -374,7 +410,9 @@ export default function App() {
       if (!sa) return 1; if (!sb) return -1;
       const sc = stripShowName(a.title).localeCompare(stripShowName(b.title));
       if (sc !== 0) return sc;
-      if (sa.season !== sb.season) return sa.season - sb.season;
+      const seasonA = sa.season ?? 0;
+      const seasonB = sb.season ?? 0;
+      if (seasonA !== seasonB) return seasonA - seasonB;
       const epA = sa.episode !== null ? sa.episode : -1;
       const epB = sb.episode !== null ? sb.episode : -1;
       return epA - epB;
