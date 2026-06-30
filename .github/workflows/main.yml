@@ -1,0 +1,33 @@
+name: Empty Main Branch
+
+on:
+  workflow_dispatch: # Allows manual trigger
+  push:
+    branches:
+      - main
+
+jobs:
+  empty-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v3
+        with:
+          ref: main
+
+      - name: Remove all files
+        run: |
+          git rm -rf .
+          # Optionally, remove .gitignore or other hidden files if needed
+          git clean -fd
+
+      - name: Commit changes
+        run: |
+          git commit -m "Empty main branch"
+        continue-on-error: true  # In case there are no changes
+
+      - name: Push changes
+        run: |
+          git push origin main --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
