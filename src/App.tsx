@@ -53,6 +53,19 @@ function parseHttpLinkTitle(url: string) {
     return "";
   }
 }
+// Reproduces the OLD (broken) title parser's output, so we can detect rows
+// in the database that still carry an auto-generated bad title (as opposed
+// to one the user typed/edited by hand) and safely re-parse just those.
+function oldAutoTitle(url: string) {
+  if (!url) return "";
+  try {
+    const u = new URL(url.trim());
+    const path = u.pathname && u.pathname !== "/" ? u.pathname.replace(/\/+$/, "") : "";
+    return path ? `${u.hostname}${path}` : u.hostname;
+  } catch {
+    return "";
+  }
+}
 // Splits a blob of text into individual http(s) links, even when links are
 // pasted back-to-back with no whitespace between them
 // (e.g. "https://buffer.comhttps://outlook.com").
@@ -160,6 +173,18 @@ async function dbAddHttpLinksBulk(records: { title: string; url: string }[]): Pr
 async function dbDeleteHttpLink(id: string): Promise<void> {
   const { error } = await supabase.from("http_links").delete().eq("id", Number(id));
   if (error) throw new Error(error.message);
+}
+
+async function dbUpdateHttpLinkTitle(id: string, title: string): Promise<void> {
+  const { data, error } = await supabase
+    .from("http_links")
+    .update({ title: title.slice(0, 1000) })
+    .eq("id", Number(id))
+    .select("id");
+  if (error) throw new Error(error.message);
+  if (!data || !data.length) {
+    throw new Error("Update was blocked by Supabase row-level security — run the updated supabase/schema.sql (adds the 'Public update access' policy) and try again");
+  }
 }
 
 async function dbDeleteHttpLinksBulk(ids: string[]): Promise<void> {
@@ -420,6 +445,26 @@ export default function App() {
     pushToast("Sorted by season + episode");
   }
 
+  async function handleRetitleAll() {
+    // Only touch rows whose title still matches what the old, broken
+    // parser would have produced — leaves any manually-typed titles alone.
+    const candidates = allLinks
+      .map((l) => ({ l, next: parseHttpLinkTitle(l.url) }))
+      .filter(({ l, next }) => next && next !== l.title && l.title === oldAutoTitle(l.url));
+    if (!candidates.length) return pushToast("No auto-generated titles need fixing", "error");
+    setSyncing(true);
+    try {
+      await Promise.all(candidates.map(({ l, next }) => dbUpdateHttpLinkTitle(l.id, next)));
+      const map = new Map(candidates.map(({ l, next }) => [l.id, next]));
+      setAllLinks((prev) => prev.map((l) => (map.has(l.id) ? { ...l, title: map.get(l.id)! } : l)));
+      pushToast(`Re-parsed ${candidates.length} title(s)`);
+    } catch (e: any) {
+      pushToast("Retitle failed: " + e.message, "error");
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   function handleDedupe() {
     const ignorePhrase = dedupeIgnore.trim().toLowerCase();
     const score = (item: HttpLink) => {
@@ -678,6 +723,7 @@ export default function App() {
           <button className={`btn${copyAllPrimary ? " btn-primary" : ""}`} disabled={syncing} onClick={handleCopyAll}><I.Copy />{copyAllLabel}</button>
           <button className="btn" disabled={syncing} onClick={handleSortAlpha}><I.Sort />Sort A–Z</button>
           <button className="btn" disabled={syncing} onClick={handleSortEpisode}><I.Sort />Sort by Episode</button>
+          <button className="btn" disabled={syncing} onClick={handleRetitleAll} title="Re-parses titles for any links still carrying the old auto-generated hostname+path title"><I.Sync />Re-parse Titles</button>
           <button className="btn" disabled={syncing} onClick={handleDedupe}><I.Dedupe />{dedupeLabel}</button>
           <button className="btn" disabled={syncing} onClick={handleExactDedupe}><I.Exact />{exactLabel}</button>
           <button className="btn" disabled={syncing} onClick={fetchLinks}><I.Sync spin={syncing} />Sync</button>
