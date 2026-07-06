@@ -32,11 +32,40 @@ function isOpaqueIdSegment(s: string): boolean {
   if (s.length >= 14 && words.length && words.every((w) => /^[0-9a-f]+$/i.test(w) || /^\d+$/.test(w))) return true;
   return false;
 }
+// True for short opaque slugs — the base62-ish per-file ids that URL shorteners
+// and file hosts use as their public identifier, e.g. pixeldrain's `jKaWhLWC`
+// or a YouTube video id. They contain no word separators and no readable
+// English, so folding them into a title just produces noise like "U JKaWhLWC".
+// Distinct from isOpaqueIdSegment, which only catches longer hex/numeric hashes.
+function isSlugLikeSegment(s: string): boolean {
+  if (!s) return false;
+  if (s.length < 6 || s.length > 40) return false;
+  if (/[-_.+\s]/.test(s)) return false; // has word separators → not a slug id
+  const hasLower = /[a-z]/.test(s);
+  const hasUpper = /[A-Z]/.test(s);
+  const hasDigit = /\d/.test(s);
+  // Mixed case (jKaWhLWC) or letters+digits with no lowercase-only word shape
+  if (hasLower && hasUpper) return true;
+  if (hasDigit && (hasLower || hasUpper) && !/^[a-z]+\d{1,4}$/i.test(s)) return true;
+  return false;
+}
 function parseHttpLinkTitle(url: string) {
   if (!url) return "";
   try {
     const u = new URL(url.trim());
-    const GENERIC = new Set(["watch", "view", "video", "videos", "stream", "streaming", "play", "embed", "link", "links", "media", "content", "item", "post", "article"]);
+    // Route/action segments that carry no title information: they appear on
+    // download-link, share-link, and file-hosting URLs as short slugs
+    // (e.g. `/u/<id>`, `/d/<id>`, `/files/file-download/<uuid>`), and folding
+    // them into the title just produces noise like "U JKaWhLWC" or
+    // "File Download 9028844b...".
+    const GENERIC = new Set([
+      "watch", "view", "video", "videos", "stream", "streaming", "play", "embed",
+      "link", "links", "media", "content", "item", "post", "article",
+      "u", "d", "f", "s", "e", "dl", "get", "go",
+      "file", "files", "download", "downloads", "file-download",
+      "share", "shared", "attachment", "attachments", "uploads", "upload",
+      "api", "cdn",
+    ]);
     const segments = u.pathname.split("/").filter(Boolean);
     if (!segments.length) return u.hostname.replace(/^www\./i, "");
 
@@ -53,11 +82,11 @@ function parseHttpLinkTitle(url: string) {
     const last = decodedSegs[decodedSegs.length - 1];
     const lastWordCount = last.replace(/[-_+.]+/g, " ").trim().split(/\s+/).filter(Boolean).length;
     let chosen = [last];
-    if (isOpaqueIdSegment(last) || lastWordCount < 3) {
+    if (isOpaqueIdSegment(last) || isSlugLikeSegment(last) || lastWordCount < 3) {
       const lookback = Math.max(0, decodedSegs.length - 6);
       for (let i = decodedSegs.length - 2; i >= lookback; i--) {
         const seg = decodedSegs[i];
-        if (!seg || isOpaqueIdSegment(seg) || GENERIC.has(seg.toLowerCase())) continue;
+        if (!seg || isOpaqueIdSegment(seg) || isSlugLikeSegment(seg) || GENERIC.has(seg.toLowerCase())) continue;
         chosen = [seg, ...chosen];
         break;
       }
@@ -85,8 +114,18 @@ function parseHttpLinkTitle(url: string) {
 function isUrlTitleWeak(title: string, url: string): boolean {
   if (!title) return true;
   try {
-    const host = new URL(url.trim()).hostname.replace(/^www\./i, "");
+    const u = new URL(url.trim());
+    const host = u.hostname.replace(/^www\./i, "");
     if (title.toLowerCase() === host.toLowerCase()) return true;
+    // If the URL's last path segment is itself an opaque id or short slug,
+    // the parsed title is only as good as the sibling/generic segment it
+    // borrowed from — worth going to the network for the real name even
+    // when the resulting string has a few words in it.
+    const segs = u.pathname.split("/").filter(Boolean);
+    const lastRaw = segs[segs.length - 1] || "";
+    let lastDecoded = lastRaw.replace(/\.(html?|php|aspx?|jsp|m3u8|mp4|mkv|webm|json|xml)$/i, "");
+    try { lastDecoded = decodeURIComponent(lastDecoded); } catch { /* keep raw */ }
+    if (lastDecoded && (isOpaqueIdSegment(lastDecoded) || isSlugLikeSegment(lastDecoded))) return true;
   } catch { /* invalid URL - let caller's own validation handle it */ }
   const words = title.replace(/[^\w\s]/g, " ").trim().split(/\s+/).filter(Boolean);
   if (words.length < 2) return true;
@@ -140,7 +179,11 @@ async function fetchContentDispositionTitle(url: string, timeoutMs = 4000): Prom
     const proxied = await fetch(`/api/resolve-filename?url=${encodeURIComponent(url)}`, { signal: withTimeout() });
     if (proxied.ok) {
       const data = await proxied.json();
+      // Prefer a real Content-Disposition filename (the raw stored name on
+      // the host) over an HTML <title> (which is a page label and may carry
+      // site branding); fall back to the page title when there's no filename.
       if (data?.filename) return filenameToTitle(data.filename);
+      if (data?.title && typeof data.title === "string" && data.title.trim()) return data.title.trim();
     }
   } catch { /* proxy unavailable (e.g. local dev without wrangler) - give up quietly */ }
 
