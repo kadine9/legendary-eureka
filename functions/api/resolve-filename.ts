@@ -28,19 +28,42 @@ export const onRequestGet = async (context: { request: Request }) => {
   }
 };
 
+// Workers' outbound fetch() doesn't send the browser-like headers a real
+// client would (no User-Agent, no Accept), and a lot of file hosts either
+// reject bare requests outright or quietly respond with a generic page that
+// carries no Content-Disposition. Presenting as an ordinary browser fixes
+// both cases and shouldn't affect hosts that don't care either way.
+const BROWSER_LIKE_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept: "*/*",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
 // Tries HEAD first (cheap — no body transfer). Some hosts don't support
-// HEAD, or only reveal Content-Disposition on GET, so if HEAD comes back
-// without the header, fall back to a ranged GET that only pulls one byte.
+// HEAD at all (they error, hang, or reset the connection rather than
+// returning a clean 4xx), and others only reveal Content-Disposition on
+// GET, so on any HEAD problem — thrown error, non-OK status, or a response
+// simply missing the header — fall back to a ranged GET that only pulls
+// one byte.
 async function probe(target: string): Promise<{ disposition: string | null; contentType: string | null }> {
-  const head = await fetch(target, { method: "HEAD", redirect: "follow" });
-  let disposition = head.headers.get("content-disposition");
-  let contentType = head.headers.get("content-type");
-  if (disposition) return { disposition, contentType };
+  let disposition: string | null = null;
+  let contentType: string | null = null;
+
+  try {
+    const head = await fetch(target, { method: "HEAD", redirect: "follow", headers: BROWSER_LIKE_HEADERS });
+    disposition = head.headers.get("content-disposition");
+    contentType = head.headers.get("content-type");
+    if (disposition) return { disposition, contentType };
+  } catch {
+    // HEAD outright failed (host doesn't support it, connection reset,
+    // etc.) - fall through to the GET attempt below instead of giving up.
+  }
 
   const ranged = await fetch(target, {
     method: "GET",
     redirect: "follow",
-    headers: { Range: "bytes=0-0" },
+    headers: { ...BROWSER_LIKE_HEADERS, Range: "bytes=0-0" },
   });
   disposition = ranged.headers.get("content-disposition");
   contentType = ranged.headers.get("content-type") || contentType;
