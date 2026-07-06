@@ -5,6 +5,7 @@ import { supabase, supabaseConfigured } from "./supabaseClient";
 type HttpLink = { id: string; title: string; url: string; created_date?: string };
 type Toast = { id: number; msg: string; kind: "ok" | "error" };
 type Confirmation = { title: string; body: string; danger?: boolean; onConfirm: () => void } | null;
+type LinkGroup = { label: string; items: HttpLink[] };
 
 const PRIO_KEY = "link-vault-priority";
 
@@ -134,6 +135,24 @@ function splitIntoGroups<T>(arr: T[], splitCount: number, perGroup: number): T[]
     return g;
   }
   return [arr];
+}
+// Splits links into one group per space-separated keyword (a link goes into
+// the group for the first keyword it matches, checked in the order the
+// keywords were given), plus a final "Ungrouped" group for links that don't
+// match any of the keywords.
+function splitByKeywords(arr: HttpLink[], keywords: string[]): LinkGroup[] {
+  const kws = keywords.map((k) => k.trim()).filter(Boolean);
+  if (!kws.length) return [{ label: "Group 1", items: arr }];
+  const buckets: LinkGroup[] = kws.map((k) => ({ label: k, items: [] }));
+  const ungrouped: HttpLink[] = [];
+  for (const item of arr) {
+    const hay = `${item.title} ${item.url}`.toLowerCase();
+    const idx = kws.findIndex((k) => hay.includes(k.toLowerCase()));
+    if (idx >= 0) buckets[idx].items.push(item);
+    else ungrouped.push(item);
+  }
+  buckets.push({ label: "Ungrouped", items: ungrouped });
+  return buckets;
 }
 function urlKeyOf(u: string) {
   return (u || "").trim().toLowerCase().replace(/\/+$/, "");
@@ -299,6 +318,7 @@ export default function App() {
   const [fHidePos, setFHidePos] = useState<"top" | "bottom">("top");
   const [fSplit, setFSplit] = useState("");
   const [fPerGroup, setFPerGroup] = useState("");
+  const [fGroupKeywords, setFGroupKeywords] = useState("");
 
   // add form
   const [addTitle, setAddTitle] = useState("");
@@ -329,7 +349,8 @@ export default function App() {
     hidePos: fHidePos,
     splitCount: parseInt(fSplit || "0", 10),
     perGroup: parseInt(fPerGroup || "0", 10),
-  }), [fShow, fTerm, fOr, fOnly, fExcept, fHideCount, fHidePos, fSplit, fPerGroup]);
+    groupKeywords: fGroupKeywords.trim(),
+  }), [fShow, fTerm, fOr, fOnly, fExcept, fHideCount, fHidePos, fSplit, fPerGroup, fGroupKeywords]);
 
   const isFilterActive = !!(filters.show || filters.term || filters.or || filters.only || filters.except || (filters.hideCount > 0));
 
@@ -361,11 +382,15 @@ export default function App() {
     return result;
   }, [allLinks, hiddenIds, phraseHiddenIds, filters]);
 
-  const groups = useMemo(() => {
+  const groups = useMemo<LinkGroup[] | null>(() => {
+    const kws = filters.groupKeywords ? filters.groupKeywords.split(/\s+/).filter(Boolean) : [];
+    if (kws.length) return splitByKeywords(filteredLinks, kws);
+
     const useSplit = filters.splitCount >= 2 || filters.perGroup >= 1;
     if (!useSplit) return null;
-    return splitIntoGroups(filteredLinks, filters.splitCount >= 2 ? filters.splitCount : 0, filters.perGroup >= 1 ? filters.perGroup : 0);
-  }, [filteredLinks, filters.splitCount, filters.perGroup]);
+    const plain = splitIntoGroups(filteredLinks, filters.splitCount >= 2 ? filters.splitCount : 0, filters.perGroup >= 1 ? filters.perGroup : 0);
+    return plain.map((items, i) => ({ label: `Group ${i + 1}`, items }));
+  }, [filteredLinks, filters.splitCount, filters.perGroup, filters.groupKeywords]);
 
   // ── Fetch ────────────────────────────────────────────────────────────────
   const fetchLinks = useCallback(async () => {
@@ -405,8 +430,8 @@ export default function App() {
   }
 
   function copyGroup(idx: number) {
-    if (!groups || !groups[idx] || !groups[idx].length) return pushToast("Nothing to copy", "error");
-    copyText(groups[idx].map((l) => l.url).join("\n"), `Copied Group ${idx + 1} — ${groups[idx].length} link(s)`);
+    if (!groups || !groups[idx] || !groups[idx].items.length) return pushToast("Nothing to copy", "error");
+    copyText(groups[idx].items.map((l) => l.url).join("\n"), `Copied ${groups[idx].label} — ${groups[idx].items.length} link(s)`);
   }
 
   function handleCopyAll() {
@@ -680,9 +705,17 @@ export default function App() {
               <input type="number" className="no-icon" value={fPerGroup} onChange={(e) => setFPerGroup(e.target.value)} placeholder="Links per group..." min={1} />
             </div>
           </div>
-          {fSplit && fPerGroup && (
+          <div className="filter-row">
+            <div className="input-wrap" style={{ flex: 1 }}><I.Split /><input type="text" value={fGroupKeywords} onChange={(e) => setFGroupKeywords(e.target.value)} placeholder="Group by keywords (e.g. 1080p 2160p CAM)" /></div>
+          </div>
+          {fSplit && fPerGroup && !fGroupKeywords.trim() && (
             <p className="hint" style={{ color: "var(--mv-amber, #f59e0b)", marginTop: "0.1rem" }}>
               ⚠ Both split fields set — "Links per group" takes priority; N groups is ignored.
+            </p>
+          )}
+          {fGroupKeywords.trim() && (
+            <p className="hint" style={{ color: "var(--mv-amber, #f59e0b)", marginTop: "0.1rem" }}>
+              ⚠ Keyword grouping is active — each space-separated keyword becomes its own group (first match wins), links matching none go to "Ungrouped". Split settings above are ignored while this is set.
             </p>
           )}
         </section>
@@ -709,21 +742,21 @@ export default function App() {
         {/* Link container */}
         <div id="link-container">
           {groups ? (
-            groups.every((g) => g.length === 0)
+            groups.every((g) => g.items.length === 0)
               ? <div className="empty-state">🐠 No links match the current filters.</div>
               : groups.map((g, idx) => (
                 <div className="group-block" key={idx}>
                   <div className="group-header">
                     <div className="group-title">
-                      🐠 Group {idx + 1}<span style={{ fontWeight: 400, color: "var(--mv-muted)", fontSize: "0.65rem" }}>of {groups.length}</span>
-                      <span className="group-badge">{g.length} link{g.length !== 1 ? "s" : ""}</span>
+                      🐠 {g.label}<span style={{ fontWeight: 400, color: "var(--mv-muted)", fontSize: "0.65rem" }}>of {groups.length}</span>
+                      <span className="group-badge">{g.items.length} link{g.items.length !== 1 ? "s" : ""}</span>
                     </div>
-                    <button className="group-copy-btn" onClick={() => copyGroup(idx)}><I.Copy />Copy Group {idx + 1}</button>
+                    <button className="group-copy-btn" onClick={() => copyGroup(idx)}><I.Copy />Copy {g.label}</button>
                   </div>
-                  {g.length === 0
+                  {g.items.length === 0
                     ? <div className="empty-state" style={{ padding: "1.25rem 1rem", fontSize: "0.72rem" }}>No links in this group.</div>
                     : <ul className="link-list-wrap" role="list" style={{ border: "none", borderRadius: 0, background: "transparent" }}>
-                        {g.map((l) => <HttpLinkRow key={l.id} l={l} selected={selectedIds.has(l.id)} onToggle={toggleSelect} onCopy={copyText} onDelete={handleDelete} />)}
+                        {g.items.map((l) => <HttpLinkRow key={l.id} l={l} selected={selectedIds.has(l.id)} onToggle={toggleSelect} onCopy={copyText} onDelete={handleDelete} />)}
                       </ul>}
                 </div>
               ))
