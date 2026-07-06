@@ -77,6 +77,75 @@ function parseHttpLinkTitle(url: string) {
     return "";
   }
 }
+// True when a URL-derived title is too thin to trust — it fell back to the
+// bare hostname, is mostly an opaque id/hash, or has fewer than two real
+// words. Titles like this are exactly the case where the URL's path didn't
+// contain the real name, and it's worth paying for a network round-trip to
+// ask the host directly (via Content-Disposition) instead.
+function isUrlTitleWeak(title: string, url: string): boolean {
+  if (!title) return true;
+  try {
+    const host = new URL(url.trim()).hostname.replace(/^www\./i, "");
+    if (title.toLowerCase() === host.toLowerCase()) return true;
+  } catch { /* invalid URL - let caller's own validation handle it */ }
+  const words = title.replace(/[^\w\s]/g, " ").trim().split(/\s+/).filter(Boolean);
+  if (words.length < 2) return true;
+  if (isOpaqueIdSegment(title.replace(/\s+/g, ""))) return true;
+  return false;
+}
+// Pulls a filename out of a raw Content-Disposition header value, handling
+// both the plain `filename="..."` form and the RFC 5987/6266 encoded
+// `filename*=UTF-8''...` form that non-ASCII names use.
+function parseContentDispositionFilename(header: string | null | undefined): string | null {
+  if (!header) return null;
+  const starMatch = header.match(/filename\*\s*=\s*[^']*''([^;]+)/i);
+  if (starMatch) {
+    try { return decodeURIComponent(starMatch[1].trim().replace(/^"|"$/g, "")); } catch { /* fall through */ }
+  }
+  const plainMatch = header.match(/filename\s*=\s*"?([^";]+)"?/i);
+  if (plainMatch) return plainMatch[1].trim().replace(/^"|"$/g, "");
+  return null;
+}
+// Cleans up a raw filename the same way parseHttpLinkTitle cleans a URL
+// segment: strip the extension, decode %xx escapes, turn -._+ into spaces,
+// title-case, and normalize SxxExx casing.
+function filenameToTitle(filename: string): string {
+  let base = filename.replace(/\.(html?|php|aspx?|jsp|m3u8|mp4|mkv|webm|avi|mov|m4v|json|xml)$/i, "");
+  try { base = decodeURIComponent(base); } catch { /* leave as-is if malformed escape */ }
+  let title = base.replace(/[-_+.]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!title) return "";
+  title = title.split(" ").map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : w)).join(" ");
+  title = title.replace(/\bs(\d{1,4})e(\d{1,4})\b/i, (_m, s, e) => `S${s}E${e}`);
+  return title;
+}
+// Asks the host that's actually serving the file for its real filename, via
+// the Content-Disposition header direct-download links commonly send
+// (e.g. `attachment; filename="Show.S01E02.mkv"`). Tries a direct
+// same-browser HEAD request first; most third-party file hosts don't send
+// permissive CORS headers though, so that request is silently blocked by
+// the browser rather than actually failing at the network level — in that
+// case we fall back to a same-origin proxy endpoint (a Cloudflare Pages
+// Function, see /functions/api/resolve-filename.ts) which makes the request
+// server-side, where browser CORS rules don't apply.
+async function fetchContentDispositionTitle(url: string, timeoutMs = 4000): Promise<string | null> {
+  const withTimeout = () => (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal ? AbortSignal.timeout(timeoutMs) : undefined);
+
+  try {
+    const res = await fetch(url, { method: "HEAD", mode: "cors", redirect: "follow", signal: withTimeout() });
+    const name = parseContentDispositionFilename(res.headers.get("content-disposition"));
+    if (name) return filenameToTitle(name);
+  } catch { /* likely blocked by CORS, or the host rejects HEAD - try the proxy */ }
+
+  try {
+    const proxied = await fetch(`/api/resolve-filename?url=${encodeURIComponent(url)}`, { signal: withTimeout() });
+    if (proxied.ok) {
+      const data = await proxied.json();
+      if (data?.filename) return filenameToTitle(data.filename);
+    }
+  } catch { /* proxy unavailable (e.g. local dev without wrangler) - give up quietly */ }
+
+  return null;
+}
 // Splits a blob of text into individual http(s) links, even when links are
 // pasted back-to-back with no whitespace between them
 // (e.g. "https://buffer.comhttps://outlook.com").
@@ -572,10 +641,16 @@ export default function App() {
 
   async function handleAdd() {
     if (!isValidHttpLink(addUrl)) return pushToast("Invalid http(s) link", "error");
-    const t = addTitle.trim() || parseHttpLinkTitle(addUrl) || "(untitled)";
+    const url = addUrl.trim();
+    const userTitle = addTitle.trim();
+    let t = userTitle || parseHttpLinkTitle(url) || "(untitled)";
     setSyncing(true);
     try {
-      const created = await dbAddHttpLink(t, addUrl.trim());
+      if (!userTitle && isUrlTitleWeak(t, url)) {
+        const discovered = await fetchContentDispositionTitle(url);
+        if (discovered) t = discovered;
+      }
+      const created = await dbAddHttpLink(t, url);
       setAllLinks((prev) => [created, ...prev]);
       setAddTitle(""); setAddUrl("");
       pushToast("Link added!");
@@ -598,7 +673,16 @@ export default function App() {
     if (!toAdd.length) return pushToast(`All ${skipped} link(s) already in vault`);
     setSyncing(true);
     try {
-      const payload = toAdd.map((s) => ({ title: parseHttpLinkTitle(s) || s.slice(0, 160), url: s }));
+      const payload = await Promise.all(
+        toAdd.map(async (s) => {
+          let title = parseHttpLinkTitle(s) || s.slice(0, 160);
+          if (isUrlTitleWeak(title, s)) {
+            const discovered = await fetchContentDispositionTitle(s);
+            if (discovered) title = discovered;
+          }
+          return { title, url: s };
+        })
+      );
       await dbAddHttpLinksBulk(payload);
       await fetchLinks();
       setAddUrl("");
