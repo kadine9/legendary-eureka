@@ -176,7 +176,15 @@ async function fetchContentDispositionTitle(url: string, timeoutMs = 4000): Prom
   } catch { /* likely blocked by CORS, or the host rejects HEAD - try the proxy */ }
 
   try {
-    const proxied = await fetch(`/api/resolve-filename?url=${encodeURIComponent(url)}`, { signal: withTimeout() });
+    // Give the proxy more time than the direct in-browser attempt above:
+    // it does up to two round-trips server-side (HEAD, then GET), each of
+    // which can take a few seconds against a slow host, so the same 4s
+    // budget that's reasonable for a single direct request is too tight
+    // here and can abort a request that would otherwise have succeeded.
+    const proxyTimeoutMs = Math.max(timeoutMs, 9000);
+    const withProxyTimeout = () =>
+      typeof AbortSignal !== "undefined" && "timeout" in AbortSignal ? AbortSignal.timeout(proxyTimeoutMs) : undefined;
+    const proxied = await fetch(`/api/resolve-filename?url=${encodeURIComponent(url)}`, { signal: withProxyTimeout() });
     if (proxied.ok) {
       const data = await proxied.json();
       // Prefer a real Content-Disposition filename (the raw stored name on
