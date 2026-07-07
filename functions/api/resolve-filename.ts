@@ -39,10 +39,31 @@ export const onRequestGet = async (context: { request: Request }) => {
 // (the typical landing-page case), we grab the first ~64KB so the
 // caller can extract <title> / og:title too.
 async function probe(target: string): Promise<{ disposition: string | null; contentType: string | null; html: string | null }> {
-  const head = await fetch(target, { method: "HEAD", redirect: "follow" });
-  let disposition = head.headers.get("content-disposition");
-  let contentType = head.headers.get("content-type");
-  if (disposition) return { disposition, contentType, html: null };
+  // Bounded per-request timeout (separate from HEAD vs GET). Some direct-
+  // download hosts (e.g. torrentcheap-style file-download links) are slow
+  // or simply hang on HEAD instead of erroring outright. Without a timeout
+  // here, a single stalled upstream request can make the whole Function
+  // run long enough that the *caller's* own timeout aborts the connection
+  // first — which surfaces client-side as a bare failed/canceled request
+  // (status 0), even though the endpoint itself is fine and would have
+  // eventually answered correctly (as a direct, un-timed browser hit does).
+  const withTimeout = (ms: number) =>
+    typeof AbortSignal !== "undefined" && "timeout" in AbortSignal ? AbortSignal.timeout(ms) : undefined;
+
+  let disposition: string | null = null;
+  let contentType: string | null = null;
+
+  // HEAD can fail outright on hosts that reset/refuse it (not just omit
+  // the header) — catch that locally so we always still try GET rather
+  // than the whole probe aborting before it gets a chance to.
+  try {
+    const head = await fetch(target, { method: "HEAD", redirect: "follow", signal: withTimeout(5000) });
+    disposition = head.headers.get("content-disposition");
+    contentType = head.headers.get("content-type");
+    if (disposition) return { disposition, contentType, html: null };
+  } catch {
+    // HEAD unsupported, refused, or timed out — fall through to GET.
+  }
 
   // GET — most hosts either reveal Content-Disposition here that they
   // withheld on HEAD, or serve an HTML page whose <title> we can scrape.
@@ -52,6 +73,7 @@ async function probe(target: string): Promise<{ disposition: string | null; cont
   const resp = await fetch(target, {
     method: "GET",
     redirect: "follow",
+    signal: withTimeout(6000),
     headers: {
       Range: "bytes=0-65535",
       "User-Agent": "Mozilla/5.0 (compatible; LinkVaultBot/1.0)",
