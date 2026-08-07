@@ -782,52 +782,39 @@ export default function App() {
     finally { setSyncing(false); }
   }
 
-  // Untags every currently-visible (filtered) link that has a tag. The tag
+  // Untags every currently-visible (filtered) link that has a tag —
+  // LOCAL STATE ONLY, no Supabase call. Deliberately doesn't touch the DB:
+  // it's meant for quickly clearing tags off-screen to eyeball/copy/dedupe,
+  // not for a permanent edit. Same "sync to restore" convention used
+  // elsewhere in this app (see the duplicate-hiding actions below) — hit
+  // Sync and the real, still-tagged data comes back from the DB. The tag
   // each link had is remembered in lastTagById so "Restore Tags" can put it
-  // back later, even after further filtering/navigation.
-  async function handleUntagVisible() {
+  // back later (also locally), even after further filtering/navigation.
+  function handleUntagVisible() {
     const matches = filteredLinks.filter((l) => isTaggedLink(l.url));
     if (!matches.length) return pushToast("No tagged links visible", "error");
-    setSyncing(true);
-    try {
-      const updates = matches.map((l) => ({ id: l.id, url: plainUrlOf(l.url) }));
-      await dbUpdateHttpLinksUrlsBulk(updates);
-      setAllLinks((prev) => prev.map((l) => {
-        const u = updates.find((x) => x.id === l.id);
-        return u ? { ...l, url: u.url } : l;
-      }));
-      setLastTagById((m) => {
-        const n = new Map(m);
-        matches.forEach((l) => { const t = tagOf(l.url); if (t) n.set(l.id, t); });
-        return n;
-      });
-      pushToast(`Untagged ${updates.length} visible link(s)`);
-    } catch (e: any) { pushToast("Untag failed: " + e.message, "error"); }
-    finally { setSyncing(false); }
+    const tags = new Map<string, string>();
+    matches.forEach((l) => { const t = tagOf(l.url); if (t) tags.set(l.id, t); });
+    setAllLinks((prev) => prev.map((l) => (tags.has(l.id) ? { ...l, url: plainUrlOf(l.url) } : l)));
+    setLastTagById((m) => { const n = new Map(m); tags.forEach((t, id) => n.set(id, t)); return n; });
+    pushToast(`Untagged ${matches.length} visible link(s) (local only — Sync will restore them)`);
   }
 
   // Re-applies the remembered previous tag to every currently-visible
   // (filtered) link that is untagged and has an entry in lastTagById —
-  // i.e. undoes a prior untag/"Untag Visible" for the links still on screen.
-  async function handleRestorePreviousTags() {
+  // i.e. undoes a prior local untag for the links still on screen.
+  // LOCAL STATE ONLY, no Supabase call — mirrors handleUntagVisible above.
+  function handleRestorePreviousTags() {
     const candidates = filteredLinks.filter((l) => !isTaggedLink(l.url) && lastTagById.has(l.id));
     if (!candidates.length) return pushToast("No previous tags to restore for visible links", "error");
-    setSyncing(true);
-    try {
-      const updates = candidates.map((l) => ({ id: l.id, url: buildTagged(plainUrlOf(l.url), lastTagById.get(l.id)!) }));
-      await dbUpdateHttpLinksUrlsBulk(updates);
-      setAllLinks((prev) => prev.map((l) => {
-        const u = updates.find((x) => x.id === l.id);
-        return u ? { ...l, url: u.url } : l;
-      }));
-      setLastTagById((m) => {
-        const n = new Map(m);
-        candidates.forEach((l) => n.delete(l.id));
-        return n;
-      });
-      pushToast(`Restored tag on ${updates.length} link(s)`);
-    } catch (e: any) { pushToast("Restore failed: " + e.message, "error"); }
-    finally { setSyncing(false); }
+    const ids = new Set(candidates.map((l) => l.id));
+    setAllLinks((prev) => prev.map((l) => {
+      if (!ids.has(l.id)) return l;
+      const t = lastTagById.get(l.id);
+      return t ? { ...l, url: buildTagged(plainUrlOf(l.url), t) } : l;
+    }));
+    setLastTagById((m) => { const n = new Map(m); ids.forEach((id) => n.delete(id)); return n; });
+    pushToast(`Restored tag on ${candidates.length} link(s) (local only)`);
   }
 
   function handleSortAlpha() {
@@ -1136,6 +1123,11 @@ export default function App() {
           <span className={`status-dot ${connected ? "connected" : "disconnected"}`} />
           <span className={`status-label ${connected ? "connected" : "disconnected"}`}>{statusLabel}</span>
           <span className="status-count">{filteredLinks.length} / {allLinks.length} shown</span>
+          {lastTagById.size > 0 && (
+            <span className="status-count" title="Untag Visible / Restore Tags only change what's displayed — Sync reloads the real, saved tags from the database.">
+              · {lastTagById.size} tag{lastTagById.size !== 1 ? "s" : ""} altered locally (not saved)
+            </span>
+          )}
         </div>
 
         {/* Actions */}
@@ -1143,8 +1135,8 @@ export default function App() {
           <button className={`btn${copyAllPrimary ? " btn-primary" : ""}`} disabled={syncing} onClick={handleCopyAll}><I.Copy />{copyAllLabel} (as is)</button>
           <button className="btn" disabled={syncing} onClick={handleCopyTag}><I.Tag />Copy as Tag</button>
           <button className="btn" disabled={syncing} onClick={handleCopyPlain}><I.TagOff />Copy as Plain</button>
-          <button className="btn" disabled={syncing || taggedVisibleCount === 0} onClick={handleUntagVisible}><I.TagOff />{untagVisibleLabel}</button>
-          <button className="btn" disabled={syncing || restorableVisibleCount === 0} onClick={handleRestorePreviousTags}><I.Tag />{restoreTagsLabel}</button>
+          <button className="btn" disabled={taggedVisibleCount === 0} onClick={handleUntagVisible}><I.TagOff />{untagVisibleLabel}</button>
+          <button className="btn" disabled={restorableVisibleCount === 0} onClick={handleRestorePreviousTags}><I.Tag />{restoreTagsLabel}</button>
           <button className="btn" disabled={syncing} onClick={handleSortAlpha}><I.Sort />Sort A–Z</button>
           <button className="btn" disabled={syncing} onClick={handleSortEpisode}><I.Sort />Sort by Episode</button>
           <button className="btn" disabled={syncing} onClick={handleDedupe}><I.Dedupe />{dedupeLabel}</button>
