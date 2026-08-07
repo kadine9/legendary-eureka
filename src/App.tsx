@@ -354,9 +354,21 @@ async function dbUpdateHttpLinkUrl(id: string, url: string): Promise<void> {
   if (error) throw new Error(error.message);
 }
 
+// Was previously one `update().eq("id", ...)` round-trip per link — fine for
+// a handful of links, but for batch actions (Untag Visible, Untag matches,
+// Restore Tags) over dozens/hundreds of links that meant dozens/hundreds of
+// sequential network requests with the whole UI disabled (`syncing`) the
+// entire time, which is what read as the app "freezing". Postgres/PostgREST
+// supports updating many rows in one round-trip via upsert: since only `id`
+// and `url` are included in each row, the merge only touches those two
+// columns and leaves title/created_at untouched. Chunked defensively so a
+// very large batch doesn't hit request-size limits in a single call.
 async function dbUpdateHttpLinksUrlsBulk(updates: { id: string; url: string }[]): Promise<void> {
-  for (const u of updates) {
-    const { error } = await supabase.from("http_links").update({ url: u.url.slice(0, 4000) }).eq("id", Number(u.id));
+  if (!updates.length) return;
+  const CHUNK_SIZE = 500;
+  for (let i = 0; i < updates.length; i += CHUNK_SIZE) {
+    const chunk = updates.slice(i, i + CHUNK_SIZE).map((u) => ({ id: Number(u.id), url: u.url.slice(0, 4000) }));
+    const { error } = await supabase.from("http_links").upsert(chunk, { onConflict: "id" });
     if (error) throw new Error(error.message);
   }
 }
@@ -817,8 +829,6 @@ export default function App() {
     } catch (e: any) { pushToast("Restore failed: " + e.message, "error"); }
     finally { setSyncing(false); }
   }
-
-  async function handleUntagFilterKeep() { /* no-op placeholder removed */ }
 
   function handleSortAlpha() {
     setAllLinks((prev) => [...prev].sort((a, b) => (a.title || a.url).localeCompare(b.title || b.url)));
