@@ -480,6 +480,11 @@ export default function App() {
 
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastIdRef = useRef(0);
+  // Tracks message ids already handled from the bookmarklet so a duplicate
+  // resend (e.g. a retry that crossed paths with our ack) is a no-op instead
+  // of re-inserting the same links. See the ack handshake in the postMessage
+  // listener below and the matching bookmarklet-side retry logic.
+  const processedMsgIdsRef = useRef<Set<string>>(new Set());
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
 
   const [priorityWords, setPriorityWords] = useState<string[]>(() => {
@@ -661,6 +666,29 @@ export default function App() {
       }
       if (!data || typeof data !== "object") return;
       if (data.source !== "magnet-vault-bookmarklet") return;
+
+      // Ack immediately, before any async DB work starts, so the bookmarklet
+      // can stop retrying as soon as possible. This runs for every inbound
+      // message (including a duplicate resend) — acking a duplicate is safe
+      // and just tells the sender "got it, stop retrying" again.
+      if (data.id && event.source) {
+        const ackPayload = { source: "magnet-vault-app", ack: data.id };
+        try {
+          (event.source as Window).postMessage(ackPayload, { targetOrigin: "*" } as any);
+        } catch {
+          try { (event.source as Window).postMessage(ackPayload, "*"); } catch { /* give up quietly */ }
+        }
+      }
+
+      // Idempotency guard: if this exact message id was already processed
+      // (e.g. a retry that crossed paths with our ack above), skip adding
+      // the links again. Messages without an id (older bookmarklet builds)
+      // fall through and are processed as before.
+      if (data.id) {
+        if (processedMsgIdsRef.current.has(data.id)) return;
+        processedMsgIdsRef.current.add(data.id);
+      }
+
       const text = String(data.text ?? data.links ?? "");
       if (!text.trim()) return;
       handleBookmarkletText(text);
@@ -1073,11 +1101,53 @@ export default function App() {
           </div>
         )}
 
-        {/* Filters */}
-        <section className="filter-section mv-card" aria-label="Filters" style={{ padding: "0.9rem 1rem", gap: "0.55rem" }}>
-          <div className="mv-card-title" style={{ marginBottom: "0.25rem" }}>
-            <I.Funnel /> Filters
-          </div>
+        {/* Action bar — sticky so the buttons stay visible without needing to
+            scroll back up past the Filters panel or down through the link list. */}
+        <div
+          className="action-bar"
+          style={{
+            position: "sticky",
+            top: 0,
+            zIndex: 20,
+            background: "rgba(8, 35, 33, 0.92)",
+            backdropFilter: "blur(6px)",
+            WebkitBackdropFilter: "blur(6px)",
+            paddingTop: "0.5rem",
+            paddingBottom: "0.5rem",
+            marginLeft: "-0.01px", // avoids collapsing against adjacent sticky margins in some browsers
+          }}
+        >
+          <button className={`btn${copyAllPrimary ? " btn-primary" : ""}`} disabled={syncing} onClick={handleCopyAll}><I.Copy />{copyAllLabel} (as is)</button>
+          <button className="btn" disabled={syncing} onClick={handleCopyTag}><I.Tag />Copy as Tag</button>
+          <button className="btn" disabled={syncing} onClick={handleCopyPlain}><I.TagOff />Copy as Plain</button>
+          <button className="btn" disabled={taggedVisibleCount === 0} onClick={handleUntagVisible}><I.TagOff />{untagVisibleLabel}</button>
+          <button className="btn" disabled={restorableVisibleCount === 0} onClick={handleRestorePreviousTags}><I.Tag />{restoreTagsLabel}</button>
+          <button className="btn" disabled={syncing} onClick={handleSortAlpha}><I.Sort />Sort A–Z</button>
+          <button className="btn" disabled={syncing} onClick={handleSortEpisode}><I.Sort />Sort by Episode</button>
+          <button className="btn" disabled={syncing} onClick={handleDedupe}><I.Dedupe />{dedupeLabel}</button>
+          <button className="btn" disabled={syncing} onClick={handleExactDedupe}><I.Exact />{exactLabel}</button>
+          <button className="btn" disabled={syncing} onClick={fetchLinks}><I.Sync spin={syncing} />Sync</button>
+          <button className="btn btn-danger" disabled={syncing} onClick={handlePurgeFiltered}><I.TrashSlash />Purge Filtered</button>
+          <button className="btn btn-danger" disabled={syncing} onClick={handlePurge}><I.Fire />Purge Vault</button>
+        </div>
+
+        {/* Status bar */}
+        <div className="status-bar">
+          <span className={`status-dot ${connected ? "connected" : "disconnected"}`} />
+          <span className={`status-label ${connected ? "connected" : "disconnected"}`}>{statusLabel}</span>
+          <span className="status-count">{filteredLinks.length} / {allLinks.length} shown</span>
+          {lastTagById.size > 0 && (
+            <span className="status-count" title="Untag Visible / Untag matches / Restore Tags only change what's displayed — Sync reloads the real, saved tags from the database.">
+              · {lastTagById.size} tag{lastTagById.size !== 1 ? "s" : ""} altered locally (not saved)
+            </span>
+          )}
+        </div>
+
+        {/* Filters — collapsed by default so the action buttons above are
+            reachable immediately, without scrolling past the filter fields. */}
+        <details className="mv-collapse" aria-label="Filters">
+          <summary><I.Chevron /><I.Funnel />Filters{isFilterActive && <span className="group-badge" style={{ marginLeft: "0.4rem" }}>active</span>}</summary>
+          <div className="collapsible-body" style={{ display: "flex", flexDirection: "column", gap: "0.55rem" }}>
           <div className="filter-row">
             <div className="input-wrap"><I.Search /><input type="text" value={fShow} onChange={(e) => setFShow(e.target.value)} placeholder="show name (e.g. the wire)" /></div>
             <div className="input-wrap"><I.Search /><input type="text" value={fTerm} onChange={(e) => setFTerm(e.target.value)} placeholder="all keywords (e.g. S03 1080p)" /></div>
@@ -1117,35 +1187,8 @@ export default function App() {
               ⚠ Keyword grouping is active — each space-separated keyword becomes its own group (first match wins), links matching none go to "Ungrouped". Split settings above are ignored while this is set.
             </p>
           )}
-        </section>
-
-        {/* Status bar */}
-        <div className="status-bar">
-          <span className={`status-dot ${connected ? "connected" : "disconnected"}`} />
-          <span className={`status-label ${connected ? "connected" : "disconnected"}`}>{statusLabel}</span>
-          <span className="status-count">{filteredLinks.length} / {allLinks.length} shown</span>
-          {lastTagById.size > 0 && (
-            <span className="status-count" title="Untag Visible / Untag matches / Restore Tags only change what's displayed — Sync reloads the real, saved tags from the database.">
-              · {lastTagById.size} tag{lastTagById.size !== 1 ? "s" : ""} altered locally (not saved)
-            </span>
-          )}
-        </div>
-
-        {/* Actions */}
-        <div className="action-bar">
-          <button className={`btn${copyAllPrimary ? " btn-primary" : ""}`} disabled={syncing} onClick={handleCopyAll}><I.Copy />{copyAllLabel} (as is)</button>
-          <button className="btn" disabled={syncing} onClick={handleCopyTag}><I.Tag />Copy as Tag</button>
-          <button className="btn" disabled={syncing} onClick={handleCopyPlain}><I.TagOff />Copy as Plain</button>
-          <button className="btn" disabled={taggedVisibleCount === 0} onClick={handleUntagVisible}><I.TagOff />{untagVisibleLabel}</button>
-          <button className="btn" disabled={restorableVisibleCount === 0} onClick={handleRestorePreviousTags}><I.Tag />{restoreTagsLabel}</button>
-          <button className="btn" disabled={syncing} onClick={handleSortAlpha}><I.Sort />Sort A–Z</button>
-          <button className="btn" disabled={syncing} onClick={handleSortEpisode}><I.Sort />Sort by Episode</button>
-          <button className="btn" disabled={syncing} onClick={handleDedupe}><I.Dedupe />{dedupeLabel}</button>
-          <button className="btn" disabled={syncing} onClick={handleExactDedupe}><I.Exact />{exactLabel}</button>
-          <button className="btn" disabled={syncing} onClick={fetchLinks}><I.Sync spin={syncing} />Sync</button>
-          <button className="btn btn-danger" disabled={syncing} onClick={handlePurgeFiltered}><I.TrashSlash />Purge Filtered</button>
-          <button className="btn btn-danger" disabled={syncing} onClick={handlePurge}><I.Fire />Purge Vault</button>
-        </div>
+          </div>
+        </details>
 
         {/* Link container */}
         <div id="link-container">
