@@ -363,6 +363,10 @@ async function dbUpdateHttpLinkUrl(id: string, url: string): Promise<void> {
 // and `url` are included in each row, the merge only touches those two
 // columns and leaves title/created_at untouched. Chunked defensively so a
 // very large batch doesn't hit request-size limits in a single call.
+//
+// NOTE: "Untag matches" now applies locally (like Untag Visible / Restore
+// Tags) instead of calling this, so this helper is currently unused there —
+// kept in case a future bulk-write action needs it.
 async function dbUpdateHttpLinksUrlsBulk(updates: { id: string; url: string }[]): Promise<void> {
   if (!updates.length) return;
   const CHUNK_SIZE = 500;
@@ -759,27 +763,24 @@ export default function App() {
     finally { setSyncing(false); }
   }
 
-  async function handleUntagFilter() {
-    const phrase = untagFilter.trim().toLowerCase();
-    if (!phrase) return pushToast("Enter a keyword first", "error");
-    const matches = allLinks.filter((l) => isTaggedLink(l.url) && `${l.title} ${l.url}`.toLowerCase().includes(phrase));
+  // Untags every tagged link (regardless of current filters) whose title or
+  // URL contains any of the given comma-separated keywords — LOCAL STATE
+  // ONLY, no Supabase call, mirroring handleUntagVisible/handleRestorePreviousTags
+  // below. Each removed tag is remembered in lastTagById so "Restore Tags"
+  // can put it back later; hitting Sync reloads the real, still-tagged data
+  // from the DB.
+  function handleUntagFilter() {
+    const phrases = untagFilter.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
+    if (!phrases.length) return pushToast("Enter a keyword first", "error");
+    const matches = allLinks.filter(
+      (l) => isTaggedLink(l.url) && phrases.some((p) => `${l.title} ${l.url}`.toLowerCase().includes(p))
+    );
     if (!matches.length) return pushToast("No tagged links match that keyword", "error");
-    setSyncing(true);
-    try {
-      const updates = matches.map((l) => ({ id: l.id, url: plainUrlOf(l.url) }));
-      await dbUpdateHttpLinksUrlsBulk(updates);
-      setAllLinks((prev) => prev.map((l) => {
-        const u = updates.find((x) => x.id === l.id);
-        return u ? { ...l, url: u.url } : l;
-      }));
-      setLastTagById((m) => {
-        const n = new Map(m);
-        matches.forEach((l) => { const t = tagOf(l.url); if (t) n.set(l.id, t); });
-        return n;
-      });
-      pushToast(`Untagged ${updates.length} link(s)`);
-    } catch (e: any) { pushToast("Untag failed: " + e.message, "error"); }
-    finally { setSyncing(false); }
+    const tags = new Map<string, string>();
+    matches.forEach((l) => { const t = tagOf(l.url); if (t) tags.set(l.id, t); });
+    setAllLinks((prev) => prev.map((l) => (tags.has(l.id) ? { ...l, url: plainUrlOf(l.url) } : l)));
+    setLastTagById((m) => { const n = new Map(m); tags.forEach((t, id) => n.set(id, t)); return n; });
+    pushToast(`Untagged ${matches.length} link(s) (local only — Sync will restore them)`);
   }
 
   // Untags every currently-visible (filtered) link that has a tag —
@@ -1124,7 +1125,7 @@ export default function App() {
           <span className={`status-label ${connected ? "connected" : "disconnected"}`}>{statusLabel}</span>
           <span className="status-count">{filteredLinks.length} / {allLinks.length} shown</span>
           {lastTagById.size > 0 && (
-            <span className="status-count" title="Untag Visible / Restore Tags only change what's displayed — Sync reloads the real, saved tags from the database.">
+            <span className="status-count" title="Untag Visible / Untag matches / Restore Tags only change what's displayed — Sync reloads the real, saved tags from the database.">
               · {lastTagById.size} tag{lastTagById.size !== 1 ? "s" : ""} altered locally (not saved)
             </span>
           )}
@@ -1257,12 +1258,12 @@ export default function App() {
                 <button className="btn" disabled={syncing} onClick={handlePasteAdd}><I.Dedupe />Add all pasted</button>
               </div>
             </div>
-            <p className="hint" style={{ marginTop: "0.85rem" }}>Untag any tagged link whose title or URL contains a keyword (case-insensitive). Only the tag is removed — the plain URL stays.</p>
+            <p className="hint" style={{ marginTop: "0.85rem" }}>Untag any tagged link whose title or URL contains a keyword (case-insensitive). Comma-separate multiple keywords to match any of them. Applied locally only — the plain URL is shown, and Sync will restore the real, saved tags from the database.</p>
             <div className="add-btn-row">
               <div className="input-wrap" style={{ flex: 1 }}>
-                <input type="text" className="no-icon" value={untagFilter} onChange={(e) => setUntagFilter(e.target.value)} placeholder="Keyword to untag (e.g. EDGE2020)" onKeyDown={(e) => { if (e.key === "Enter") handleUntagFilter(); }} />
+                <input type="text" className="no-icon" value={untagFilter} onChange={(e) => setUntagFilter(e.target.value)} placeholder="Keyword(s) to untag, comma-separated (e.g. EDGE2020, YIFY)" onKeyDown={(e) => { if (e.key === "Enter") handleUntagFilter(); }} />
               </div>
-              <button className="btn" disabled={syncing} onClick={handleUntagFilter}><I.TagOff />Untag matches</button>
+              <button className="btn" onClick={handleUntagFilter}><I.TagOff />Untag matches</button>
             </div>
           </div>
         </details>
