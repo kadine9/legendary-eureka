@@ -478,6 +478,13 @@ export default function App() {
   const [hidePhrase, setHidePhrase] = useState("");
   const [phraseHiddenIds, setPhraseHiddenIds] = useState<Set<string>>(new Set());
 
+  // Remembers the most recently removed tag for each link id (in-memory only,
+  // not persisted to the DB or across reloads) so a batch "Restore Tags"
+  // action can put tags back after a batch untag. Populated by every place
+  // that strips a tag: single-row untag, single-row retag-to-blank, the
+  // keyword-based "Untag matches" batch action, and "Untag Visible" below.
+  const [lastTagById, setLastTagById] = useState<Map<string, string>>(new Map());
+
   // filters
   const [fShow, setFShow] = useState("");
   const [fTerm, setFTerm] = useState("");
@@ -562,6 +569,14 @@ export default function App() {
     const plain = splitIntoGroups(filteredLinks, filters.splitCount >= 2 ? filters.splitCount : 0, filters.perGroup >= 1 ? filters.perGroup : 0);
     return plain.map((items, i) => ({ label: `Group ${i + 1}`, items }));
   }, [filteredLinks, filters.splitCount, filters.perGroup, filters.groupKeywords]);
+
+  // Visible (filtered) links that currently carry a tag — the scope for "Untag Visible".
+  const taggedVisibleCount = useMemo(() => filteredLinks.filter((l) => isTaggedLink(l.url)).length, [filteredLinks]);
+  // Visible links that are currently untagged but have a remembered previous tag — the scope for "Restore Tags".
+  const restorableVisibleCount = useMemo(
+    () => filteredLinks.filter((l) => !isTaggedLink(l.url) && lastTagById.has(l.id)).length,
+    [filteredLinks, lastTagById]
+  );
 
   // ── Fetch ────────────────────────────────────────────────────────────────
   const fetchLinks = useCallback(async () => {
@@ -678,6 +693,8 @@ export default function App() {
     return filteredLinks;
   }
 
+  // Copies the plain URL only — the "|Tag" suffix (if any) is always stripped
+  // via plainUrlOf, regardless of whether the source link is tagged.
   function handleCopyPlain() {
     const sel = copyScope();
     if (!sel.length) return pushToast("Nothing to copy", "error");
@@ -695,12 +712,13 @@ export default function App() {
   async function handleUntag(id: string) {
     const item = allLinks.find((l) => l.id === id);
     if (!item) return;
-    const plain = plainUrlOf(item.url);
+    const { url: plain, tag } = splitTag(item.url);
     if (plain === item.url) return; // already untagged
     setSyncing(true);
     try {
       await dbUpdateHttpLinkUrl(id, plain);
       setAllLinks((prev) => prev.map((l) => (l.id === id ? { ...l, url: plain } : l)));
+      if (tag) setLastTagById((m) => { const n = new Map(m); n.set(id, tag); return n; });
       pushToast("Untagged");
     } catch (e: any) { pushToast("Untag failed: " + e.message, "error"); }
     finally { setSyncing(false); }
@@ -718,6 +736,12 @@ export default function App() {
     try {
       await dbUpdateHttpLinkUrl(id, newUrl);
       setAllLinks((prev) => prev.map((l) => (l.id === id ? { ...l, url: newUrl } : l)));
+      if (next.trim()) {
+        // A real tag now exists on this link; it's no longer "restorable".
+        setLastTagById((m) => { if (!m.has(id)) return m; const n = new Map(m); n.delete(id); return n; });
+      } else if (tag) {
+        setLastTagById((m) => { const n = new Map(m); n.set(id, tag); return n; });
+      }
       pushToast(next.trim() ? "Tag updated" : "Untagged");
     } catch (e: any) { pushToast("Retag failed: " + e.message, "error"); }
     finally { setSyncing(false); }
@@ -736,10 +760,65 @@ export default function App() {
         const u = updates.find((x) => x.id === l.id);
         return u ? { ...l, url: u.url } : l;
       }));
+      setLastTagById((m) => {
+        const n = new Map(m);
+        matches.forEach((l) => { const t = tagOf(l.url); if (t) n.set(l.id, t); });
+        return n;
+      });
       pushToast(`Untagged ${updates.length} link(s)`);
     } catch (e: any) { pushToast("Untag failed: " + e.message, "error"); }
     finally { setSyncing(false); }
   }
+
+  // Untags every currently-visible (filtered) link that has a tag. The tag
+  // each link had is remembered in lastTagById so "Restore Tags" can put it
+  // back later, even after further filtering/navigation.
+  async function handleUntagVisible() {
+    const matches = filteredLinks.filter((l) => isTaggedLink(l.url));
+    if (!matches.length) return pushToast("No tagged links visible", "error");
+    setSyncing(true);
+    try {
+      const updates = matches.map((l) => ({ id: l.id, url: plainUrlOf(l.url) }));
+      await dbUpdateHttpLinksUrlsBulk(updates);
+      setAllLinks((prev) => prev.map((l) => {
+        const u = updates.find((x) => x.id === l.id);
+        return u ? { ...l, url: u.url } : l;
+      }));
+      setLastTagById((m) => {
+        const n = new Map(m);
+        matches.forEach((l) => { const t = tagOf(l.url); if (t) n.set(l.id, t); });
+        return n;
+      });
+      pushToast(`Untagged ${updates.length} visible link(s)`);
+    } catch (e: any) { pushToast("Untag failed: " + e.message, "error"); }
+    finally { setSyncing(false); }
+  }
+
+  // Re-applies the remembered previous tag to every currently-visible
+  // (filtered) link that is untagged and has an entry in lastTagById —
+  // i.e. undoes a prior untag/"Untag Visible" for the links still on screen.
+  async function handleRestorePreviousTags() {
+    const candidates = filteredLinks.filter((l) => !isTaggedLink(l.url) && lastTagById.has(l.id));
+    if (!candidates.length) return pushToast("No previous tags to restore for visible links", "error");
+    setSyncing(true);
+    try {
+      const updates = candidates.map((l) => ({ id: l.id, url: buildTagged(plainUrlOf(l.url), lastTagById.get(l.id)!) }));
+      await dbUpdateHttpLinksUrlsBulk(updates);
+      setAllLinks((prev) => prev.map((l) => {
+        const u = updates.find((x) => x.id === l.id);
+        return u ? { ...l, url: u.url } : l;
+      }));
+      setLastTagById((m) => {
+        const n = new Map(m);
+        candidates.forEach((l) => n.delete(l.id));
+        return n;
+      });
+      pushToast(`Restored tag on ${updates.length} link(s)`);
+    } catch (e: any) { pushToast("Restore failed: " + e.message, "error"); }
+    finally { setSyncing(false); }
+  }
+
+  async function handleUntagFilterKeep() { /* no-op placeholder removed */ }
 
   function handleSortAlpha() {
     setAllLinks((prev) => [...prev].sort((a, b) => (a.title || a.url).localeCompare(b.title || b.url)));
@@ -972,6 +1051,8 @@ export default function App() {
   const copyAllPrimary = selectedIds.size > 0;
   const dedupeLabel = isFilterActive ? "Dedupe (filtered)" : "Dedupe";
   const exactLabel = isFilterActive ? "Exact (filtered)" : "Exact Dedupe";
+  const untagVisibleLabel = taggedVisibleCount > 0 ? `Untag Visible (${taggedVisibleCount})` : "Untag Visible";
+  const restoreTagsLabel = restorableVisibleCount > 0 ? `Restore Tags (${restorableVisibleCount})` : "Restore Tags";
 
   return (
     <>
@@ -1052,6 +1133,8 @@ export default function App() {
           <button className={`btn${copyAllPrimary ? " btn-primary" : ""}`} disabled={syncing} onClick={handleCopyAll}><I.Copy />{copyAllLabel} (as is)</button>
           <button className="btn" disabled={syncing} onClick={handleCopyTag}><I.Tag />Copy as Tag</button>
           <button className="btn" disabled={syncing} onClick={handleCopyPlain}><I.TagOff />Copy as Plain</button>
+          <button className="btn" disabled={syncing || taggedVisibleCount === 0} onClick={handleUntagVisible}><I.TagOff />{untagVisibleLabel}</button>
+          <button className="btn" disabled={syncing || restorableVisibleCount === 0} onClick={handleRestorePreviousTags}><I.Tag />{restoreTagsLabel}</button>
           <button className="btn" disabled={syncing} onClick={handleSortAlpha}><I.Sort />Sort A–Z</button>
           <button className="btn" disabled={syncing} onClick={handleSortEpisode}><I.Sort />Sort by Episode</button>
           <button className="btn" disabled={syncing} onClick={handleDedupe}><I.Dedupe />{dedupeLabel}</button>
