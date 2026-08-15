@@ -517,6 +517,8 @@ export default function App() {
   const [addTitle, setAddTitle] = useState("");
   const [addUrl, setAddUrl] = useState("");
   const [untagFilter, setUntagFilter] = useState("");
+  const [batchTagFilter, setBatchTagFilter] = useState("");
+  const [batchTagValue, setBatchTagValue] = useState("");
 
   // ── Toast / confirm helpers ──────────────────────────────────────────────
   const pushToast = useCallback((msg: string, kind: "ok" | "error" = "ok") => {
@@ -823,6 +825,36 @@ export default function App() {
     setAllLinks((prev) => prev.map((l) => (tags.has(l.id) ? { ...l, url: plainUrlOf(l.url) } : l)));
     setLastTagById((m) => { const n = new Map(m); tags.forEach((t, id) => n.set(id, t)); return n; });
     pushToast(`Untagged ${matches.length} link(s) (local only — Sync will restore them)`);
+  }
+
+  // Tags every link (regardless of current tag/filter state) whose title or
+  // URL contains any of the given comma-separated keywords with the given
+  // tag text, overwriting any existing tag on those links. Unlike
+  // "Untag matches" above, this WRITES TO THE DATABASE (via the bulk-upsert
+  // helper) since the whole point is to leave a durable tag in place, not a
+  // throwaway local view.
+  async function handleBatchTag() {
+    const phrases = batchTagFilter.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
+    const tag = batchTagValue.trim();
+    if (!phrases.length) return pushToast("Enter a keyword first", "error");
+    if (!tag) return pushToast("Enter a tag first", "error");
+    const matches = allLinks.filter((l) => phrases.some((p) => `${l.title} ${l.url}`.toLowerCase().includes(p)));
+    if (!matches.length) return pushToast("No links match that keyword", "error");
+    const updates = matches
+      .map((l) => ({ id: l.id, url: buildTagged(plainUrlOf(l.url), tag) }))
+      .filter((u, i) => u.url !== matches[i].url);
+    if (!updates.length) return pushToast(`All matching link(s) already tagged "${tag}"`);
+    setSyncing(true);
+    try {
+      await dbUpdateHttpLinksUrlsBulk(updates);
+      const urlById = new Map(updates.map((u) => [u.id, u.url]));
+      setAllLinks((prev) => prev.map((l) => (urlById.has(l.id) ? { ...l, url: urlById.get(l.id)! } : l)));
+      pushToast(`Tagged ${updates.length} link(s) with "${tag}"`);
+    } catch (e: any) {
+      pushToast("Batch tag failed: " + e.message, "error");
+    } finally {
+      setSyncing(false);
+    }
   }
 
   // Untags every currently-visible (filtered) link that has a tag —
@@ -1310,6 +1342,16 @@ export default function App() {
                 <input type="text" className="no-icon" value={untagFilter} onChange={(e) => setUntagFilter(e.target.value)} placeholder="Keyword(s) to untag, comma-separated (e.g. EDGE2020, YIFY)" onKeyDown={(e) => { if (e.key === "Enter") handleUntagFilter(); }} />
               </div>
               <button className="btn" onClick={handleUntagFilter}><I.TagOff />Untag matches</button>
+            </div>
+            <p className="hint" style={{ marginTop: "0.85rem" }}>Tag every link whose title or URL contains a keyword (case-insensitive), setting the given tag on all of them. Comma-separate multiple keywords to match any of them. This is saved to the database immediately and overwrites any existing tag on matching links.</p>
+            <div className="add-btn-row">
+              <div className="input-wrap" style={{ flex: 1 }}>
+                <input type="text" className="no-icon" value={batchTagFilter} onChange={(e) => setBatchTagFilter(e.target.value)} placeholder="Keyword(s) to match, comma-separated (e.g. EDGE2020, YIFY)" />
+              </div>
+              <div className="input-wrap" style={{ flex: 1 }}>
+                <input type="text" className="no-icon" value={batchTagValue} onChange={(e) => setBatchTagValue(e.target.value)} placeholder="Tag to apply (e.g. Release.Name)" onKeyDown={(e) => { if (e.key === "Enter") handleBatchTag(); }} />
+              </div>
+              <button className="btn" disabled={syncing} onClick={handleBatchTag}><I.Tag />Batch Tag</button>
             </div>
           </div>
         </details>
