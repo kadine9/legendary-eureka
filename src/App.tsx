@@ -308,6 +308,61 @@ function urlKeyOf(u: string) {
   return plainUrlOf(u).toLowerCase().replace(/\/+$/, "");
 }
 
+function titleCaseWords(s: string): string {
+  return s
+    .split(" ")
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+// Auto-grouping rules:
+// - No season/episode info at all → treated as a standalone item (movie).
+//   Each one gets its own group, labeled by its title.
+// - Has a season but the season has 3 or fewer episodes in this dataset →
+//   too thin to be its own group, goes into "Ungrouped".
+// - Has a season with MORE than 3 episodes → gets its own "<Show> S0N" group.
+// - Has an episode number but no season (rare, e.g. "Episode 12") → "Ungrouped".
+const AUTO_GROUP_SEASON_THRESHOLD = 3;
+
+function autoGroupLinks(items: HttpLink[]): LinkGroup[] {
+  const movieGroups: LinkGroup[] = [];
+  const seasonBuckets = new Map<string, { show: string; season: number; items: HttpLink[] }>();
+  const leftovers: HttpLink[] = [];
+
+  for (const item of items) {
+    const se = parseSeasonEpisode(item.title);
+    if (!se) {
+      // No S/E pattern at all -> standalone item, own group.
+      movieGroups.push({ label: item.title || "(untitled)", items: [item] });
+      continue;
+    }
+    if (se.season === null) {
+      // Episode-only, no season known -> not enough to group by season.
+      leftovers.push(item);
+      continue;
+    }
+    const show = stripShowName(item.title) || "unknown";
+    const key = `${show}|s${se.season}`;
+    if (!seasonBuckets.has(key)) seasonBuckets.set(key, { show, season: se.season, items: [] });
+    seasonBuckets.get(key)!.items.push(item);
+  }
+
+  const seasonGroups: LinkGroup[] = [];
+  for (const { show, season, items: arr } of seasonBuckets.values()) {
+    if (arr.length > AUTO_GROUP_SEASON_THRESHOLD) {
+      const label = `${titleCaseWords(show)} S${String(season).padStart(2, "0")}`;
+      seasonGroups.push({ label, items: arr });
+    } else {
+      leftovers.push(...arr);
+    }
+  }
+
+  const groups: LinkGroup[] = [...movieGroups, ...seasonGroups];
+  if (leftovers.length) groups.push({ label: "Ungrouped", items: leftovers });
+  return groups;
+}
+
 // ── API (Supabase) — HTTP links ─────────────────────────────────────────────
 function rowToHttpLink(r: any): HttpLink {
   return {
@@ -516,6 +571,7 @@ export default function App() {
   const [fSplit, setFSplit] = useState("");
   const [fPerGroup, setFPerGroup] = useState("");
   const [fGroupKeywords, setFGroupKeywords] = useState("");
+  const [autoGroupActive, setAutoGroupActive] = useState(false);
 
   // add form
   const [addTitle, setAddTitle] = useState("");
@@ -583,6 +639,8 @@ export default function App() {
   }, [allLinks, hiddenIds, phraseHiddenIds, filters]);
 
   const groups = useMemo<LinkGroup[] | null>(() => {
+    if (autoGroupActive) return autoGroupLinks(filteredLinks);
+
     const kws = filters.groupKeywords ? filters.groupKeywords.split(/\s+/).filter(Boolean) : [];
     if (kws.length) return splitByKeywords(filteredLinks, kws);
 
@@ -590,7 +648,7 @@ export default function App() {
     if (!useSplit) return null;
     const plain = splitIntoGroups(filteredLinks, filters.splitCount >= 2 ? filters.splitCount : 0, filters.perGroup >= 1 ? filters.perGroup : 0);
     return plain.map((items, i) => ({ label: `Group ${i + 1}`, items }));
-  }, [filteredLinks, filters.splitCount, filters.perGroup, filters.groupKeywords]);
+  }, [filteredLinks, filters.splitCount, filters.perGroup, filters.groupKeywords, autoGroupActive]);
 
   // Visible (filtered) links that currently carry a tag — the scope for "Untag Visible".
   const taggedVisibleCount = useMemo(() => filteredLinks.filter((l) => isTaggedLink(l.url)).length, [filteredLinks]);
@@ -1185,14 +1243,19 @@ export default function App() {
           <div className="filter-row">
             <div className="input-wrap" style={{ flex: 1 }}><I.Split /><input type="text" value={fGroupKeywords} onChange={(e) => setFGroupKeywords(e.target.value)} placeholder="Group by keywords (e.g. 1080p 2160p CAM)" /></div>
           </div>
-          {fSplit && fPerGroup && !fGroupKeywords.trim() && (
+          {fSplit && fPerGroup && !fGroupKeywords.trim() && !autoGroupActive && (
             <p className="hint" style={{ color: "var(--mv-amber, #f59e0b)", marginTop: "0.1rem" }}>
               ⚠ Both split fields set — "Links per group" takes priority; N groups is ignored.
             </p>
           )}
-          {fGroupKeywords.trim() && (
+          {fGroupKeywords.trim() && !autoGroupActive && (
             <p className="hint" style={{ color: "var(--mv-amber, #f59e0b)", marginTop: "0.1rem" }}>
               ⚠ Keyword grouping is active — each space-separated keyword becomes its own group (first match wins), links matching none go to "Ungrouped". Split settings above are ignored while this is set.
+            </p>
+          )}
+          {autoGroupActive && (
+            <p className="hint" style={{ color: "var(--mv-amber, #f59e0b)", marginTop: "0.1rem" }}>
+              ⚠ Auto Group is active — movies each get their own group, seasons with more than {AUTO_GROUP_SEASON_THRESHOLD} episodes get their own group, everything else lands in "Ungrouped". Keyword/split grouping is ignored while this is on.
             </p>
           )}
         </section>
@@ -1224,6 +1287,7 @@ export default function App() {
           <button className="btn" disabled={syncing} onClick={handleSortEpisode}><I.Sort />Sort by Episode</button>
           <button className="btn" disabled={syncing} onClick={handleDedupe}><I.Dedupe />{dedupeLabel}</button>
           <button className="btn" disabled={syncing} onClick={handleExactDedupe}><I.Exact />{exactLabel}</button>
+          <button className={`btn${autoGroupActive ? " btn-primary" : ""}`} disabled={syncing} onClick={() => setAutoGroupActive((v) => !v)}><I.Split />{autoGroupActive ? "Auto Group: ON" : "Auto Group"}</button>
           <button className="btn" disabled={syncing} onClick={fetchLinks}><I.Sync spin={syncing} />Sync</button>
           <button className="btn btn-danger" disabled={syncing} onClick={handlePurgeFiltered}><I.TrashSlash />Purge Filtered</button>
           <button className="btn btn-danger" disabled={syncing} onClick={handlePurge}><I.Fire />Purge Vault</button>
